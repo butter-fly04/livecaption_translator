@@ -69,9 +69,9 @@ FADE_AFTER_SECONDS = 15
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 VOSK_MODELS = {
-    "ru": "/home/penguin-lm/Realtime-Subtitles-Generator-using-Python/vosk-model-small-ru-0.22",
-    "zh": "/home/penguin-lm/Realtime-Subtitles-Generator-using-Python/vosk-model-small-cn-0.22",
-    "es": "/home/penguin-lm/Realtime-Subtitles-Generator-using-Python/vosk-model-small-es-0.42",
+    "ru": "/path to russian VOSK model",
+    "zh": "/path to chinese VOSK model",
+    "es": "/path to spanish VOSK model",
 }
 
 # -------------------- TRANSLATION --------------------
@@ -290,11 +290,11 @@ class LiveCaptionApp:
     def _build_ui(self):
         self.root = tk.Tk()
         self.root.title("Live Captions")
+        self.root.withdraw()                      # <-- ADD THIS: hide until fully configured
 
         # Frameless, always on top
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-
         self.caption_font = tkfont.Font(family=FONT_FAMILY, size=FONT_SIZE, weight=FONT_WEIGHT)
 
         # Side-by-side grid: MAX_LINES rows × 2 columns
@@ -378,9 +378,16 @@ class LiveCaptionApp:
         y = sh - h - 60
 
         self.root.geometry(f"{w}x{h}+{x}+{y}")
-        self.root.attributes("-alpha", WINDOW_OPACITY)
         self.root.configure(bg=BG_COLOR)
         self.caption_frame.configure(bg=BG_COLOR)
+
+        # --- OPACITY FIX for Cinnamon / X11 ---
+        # Frameless windows must be mapped by the compositor before -alpha works.
+        # We withdraw in _build_ui, do all setup, then deiconify and wait.
+        self.root.deiconify()
+        self.root.wait_visibility()
+        self.root.attributes("-alpha", WINDOW_OPACITY)
+        # ---------------------------------------
 
         # Update wraplengths to fit half the window width
         col_width = max(200, (w - 100) // 2)
