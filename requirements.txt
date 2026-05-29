@@ -1,0 +1,5 @@
+pulsectl
+vosk
+requests
+deep-translator
+argostranslate
