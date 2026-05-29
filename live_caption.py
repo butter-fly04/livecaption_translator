@@ -39,14 +39,14 @@ WINDOW_SIZE_PERCENT = 70
 
 # Window opacity: 0.1 (very transparent) to 1.0 (fully opaque)
 # NOTE: Opacity may not work on all window managers (e.g., Cinnamon X11 with frameless windows)
-WINDOW_OPACITY = 0.88
+WINDOW_OPACITY = 0.93
 
 # Colors
 BG_COLOR = "#1a1a1a"
 FG_COLOR = "#ffffff"
 
 # Font
-FONT_FAMILY = "DejaVu Sans"
+FONT_FAMILY = "Noto Sans"
 FONT_SIZE = 10
 FONT_WEIGHT = "bold"  # "normal" or "bold"
 
