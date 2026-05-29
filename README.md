@@ -36,18 +36,6 @@ pip install --upgrade pip
 
 ### Step 5: Install Dependencies
 
-Create a `requirements.txt` file in the project directory:
-
-```
-pulsectl
-vosk
-requests
-deep-translator
-argostranslate
-```
-
-Then install all dependencies:
-
 ```bash
 pip install -r requirements.txt
 ```
