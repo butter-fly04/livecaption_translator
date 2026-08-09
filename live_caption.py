@@ -184,12 +184,12 @@ class DeepLTranslator(TranslatorBase):
         r.raise_for_status()
         return r.json()["translations"][0]["text"]
 
-
 class GoogleTranslator(TranslatorBase):
-    """Free translation using Google Translate (via deep-translator)."""
     def __init__(self, from_code: str, to_code: str):
-        self.from_code = from_code
-        self.to_code = to_code
+        # Map VOSK keys → Google Translate codes
+        gmap = {"zh": "zh-CN", "zh-cn": "zh-CN", "zh-tw": "zh-TW"}
+        self.from_code = gmap.get(from_code.lower(), from_code)
+        self.to_code = gmap.get(to_code.lower(), to_code)
         self._translator = None
 
     def translate(self, text: str) -> str:
