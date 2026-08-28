@@ -115,8 +115,6 @@ VOSK_MODELS = {
     "en": "/home/username/vosk_models/vosk-model-en-us-0.22",
     "es": "/home/username/vosk_models/vosk-model-es-0.42",
     "ru": "/home/username/vosk_models/vosk-model-ru-0.10",
-    "fr": "/home/username/vosk_models/vosk-model-fr-0.22",
-    "de": "/home/username/vosk_models/vosk-model-de-0.21",
     "zh": "/home/username/vosk_models/vosk-model-cn-0.22",
 }
 ```
