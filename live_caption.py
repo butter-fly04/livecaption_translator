@@ -1,14 +1,17 @@
+```python
 #!/usr/bin/env python3
 """
-Live Caption Generator for Linux Mint
+Live Caption Generator for Linux
 Captures system audio output and transcribes in real-time using VOSK.
-Optional real-time translation. Side-by-side layout.
+Optional real-time translation with multi-service fallback chain.
+Side-by-side layout.
 """
 
 import argparse
 import json
 import os
 import queue
+import random
 import subprocess
 import sys
 import threading
@@ -28,196 +31,371 @@ except ImportError:
     print("Missing dependency: vosk  (pip3 install vosk)")
     sys.exit(1)
 
+try:
+    import requests
+except ImportError:
+    print("Missing dependency: requests  (pip3 install requests)")
+    sys.exit(1)
+
 
 # ==================== CUSTOMIZE THESE ====================
-# Base window size (pixels)
 BASE_WIDTH = 1400
 BASE_HEIGHT = 150
-
-# Scale the window size (100 = base size, 150 = 1.5x, 50 = half size)
 WINDOW_SIZE_PERCENT = 70
-
-# Window opacity: 0.1 (very transparent) to 1.0 (fully opaque)
-# NOTE: Opacity may not work on all window managers (e.g., Cinnamon X11 with frameless windows)
 WINDOW_OPACITY = 0.93
-
-# Colors
 BG_COLOR = "#1a1a1a"
 FG_COLOR = "#ffffff"
-
-# Font
 FONT_FAMILY = "Noto Sans"
 FONT_SIZE = 10
-FONT_WEIGHT = "bold"  # "normal" or "bold"
-
-# Caption behavior
+FONT_WEIGHT = "bold"
 MAX_LINES = 3
 FADE_AFTER_SECONDS = 15
 
-# -------------------- VOSK MODEL PATHS --------------------
-# Map language codes to VOSK model directories.
-# Keys can be any short code you want (e.g., "en", "zh", "es").
-# Values must be absolute paths to extracted VOSK model folders.
-#
-# Language codes are typically ISO 639-1 (2-letter):
-#   en=English, es=Spanish, fr=French, de=German, it=Italian,
-#   pt=Portuguese, ru=Russian, zh=Chinese, ja=Japanese, ar=Arabic, etc.
-# Full list: https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
-#
-# NOTE: The source key should also match the 'from' language code expected
-# by your chosen translation engine (Argos/DeepL/LibreTranslate).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 VOSK_MODELS = {
-    "ru": "/path to russian VOSK model",
-    "zh": "/path to chinese VOSK model",
-    "es": "/path to spanish VOSK model",
+    "ru": "/path/to/vosk/medel/vosk-model-small-ru-0.22",
+    "zh": "/path/to/vosk/medel/vosk-model-small-cn-0.22",
+    "es": "/path/to/vosk/medel/vosk-model-small-es-0.42",
+    "ar": "/path/to/vosk/medel/vosk-model-ar-mgb2-0.4",
 }
 
-# -------------------- TRANSLATION --------------------
-# Engine: "argos" (offline), "libre" (online), "deepl" (online), "google" (online, free)
-TRANSLATOR_ENGINE = "google"
+# ==================== TRANSLATION CONFIG ====================
+# Services to use, in order of preference.
+# MyMemory is the primary, Google is the fallback.
+TRANSLATION_SERVICES = ["mymemory", "google"]
 
-# LibreTranslate endpoint (only for engine="libre")
-LIBRETRANSLATE_URL = "https://libretranslate.de/translate"
+# Per-service rate limiting (seconds between requests to the SAME service)
+MIN_DELAY = 1.0
+MAX_DELAY = 2.5
 
-# DeepL API key (only for engine="deepl")
-DEEPL_API_KEY = ""
-# =======================================================
+# Circuit breaker: after this many consecutive failures, stop trying the service
+# for CIRCUIT_RESET seconds, then try again.
+MAX_FAILURES = 3
+CIRCUIT_RESET = 60  # seconds
+
+# Cache
+CACHE_SIZE = 500
 
 SAMPLE_RATE = 16000
 CHUNK_BYTES = 4096
 
 
-# ==================== TRANSLATORS ====================
+# ==================== ERROR CLASSES ====================
 
-class TranslatorBase:
-    def translate(self, text: str) -> str:
+class TranslationError(Exception):
+    """Base translation error."""
+    pass
+
+class RateLimitError(TranslationError):
+    """Service returned 429 or equivalent."""
+    pass
+
+class ServiceError(TranslationError):
+    """Service returned an error."""
+    pass
+
+
+# ==================== CACHE ====================
+
+class TranslationCache:
+    """Thread-safe cache for translations."""
+
+    def __init__(self, max_size=500):
+        self.max_size = max_size
+        self._cache = {}
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            return self._cache.get(key)
+
+    def set(self, key, value):
+        with self._lock:
+            if len(self._cache) >= self.max_size:
+                oldest = next(iter(self._cache))
+                del self._cache[oldest]
+            self._cache[key] = value
+
+
+# ==================== TRANSLATION SERVICES ====================
+
+class TranslationService:
+    """Base class for translation services with circuit breaker."""
+
+    def __init__(self, name, from_code, to_code):
+        self.name = name
+        self.from_code = from_code
+        self.to_code = to_code
+        self.session = requests.Session()
+        # NO automatic retries — we handle everything manually
+        self.failure_count = 0
+        self.circuit_open_until = 0
+        self.last_request_time = 0
+        self._lock = threading.Lock()
+
+    def is_available(self):
+        """Check if circuit breaker allows this service."""
+        if time.time() < self.circuit_open_until:
+            remaining = self.circuit_open_until - time.time()
+            return False
+        return True
+
+    def _wait_rate_limit(self):
+        """Enforce per-service rate limiting."""
+        with self._lock:
+            now = time.time()
+            elapsed = now - self.last_request_time
+            delay = random.uniform(MIN_DELAY, MAX_DELAY)
+            if elapsed < delay:
+                time.sleep(delay - elapsed)
+            self.last_request_time = time.time()
+
+    def record_success(self):
+        """Reset failure count on success."""
+        self.failure_count = 0
+        self.circuit_open_until = 0
+
+    def record_failure(self):
+        """Increment failure count and maybe open circuit."""
+        self.failure_count += 1
+        if self.failure_count >= MAX_FAILURES:
+            self.circuit_open_until = time.time() + CIRCUIT_RESET
+            print(f"  [{self.name}] Circuit breaker OPEN for {CIRCUIT_RESET}s "
+                  f"(failures: {self.failure_count})")
+
+    def translate(self, text):
+        """Override in subclass."""
         raise NotImplementedError
 
 
-class ArgosTranslator(TranslatorBase):
-    """Offline translation using Argos Translate (OpenNMT)."""
-    def __init__(self, from_code: str, to_code: str):
+class MyMemoryTranslator(TranslationService):
+    """MyMemory translation API — free, 5000 words/day without key."""
+
+    def __init__(self, from_code, to_code):
+        super().__init__("MyMemory", from_code, to_code)
+        self.url = "https://api.mymemory.translated.net/get"
+
+    def translate(self, text):
+        self._wait_rate_limit()
+
+        params = {
+            "q": text,
+            "langpair": f"{self.from_code}|{self.to_code}",
+        }
+
+        try:
+            response = self.session.get(self.url, params=params, timeout=8)
+
+            if response.status_code == 429:
+                raise RateLimitError("MyMemory returned 429")
+
+            response.raise_for_status()
+            data = response.json()
+
+            # Check for errors in response
+            status = data.get("responseStatus", 200)
+            if status != 200:
+                raise ServiceError(f"MyMemory error: status={status}")
+
+            translated = data.get("responseData", {}).get("translatedText", "")
+            if not translated:
+                raise ServiceError("MyMemory returned empty translation")
+
+            return translated
+
+        except RateLimitError:
+            raise
+        except ServiceError:
+            raise
+        except Exception as e:
+            raise ServiceError(f"MyMemory error: {e}")
+
+
+class GoogleTranslator(TranslationService):
+    """Google Translate free web endpoint."""
+
+    # Rotate between endpoints
+    ENDPOINTS = [
+        "https://translate.google.com/translate_a/single",
+        "https://translate.googleapis.com/translate_a/single",
+    ]
+
+    HEADERS = [
+        {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://translate.google.com/",
+        },
+        {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://translate.google.com/",
+        },
+    ]
+
+    def __init__(self, from_code, to_code):
+        gmap = {"zh": "zh-CN", "zh-cn": "zh-CN", "zh-tw": "zh-TW"}
+        super().__init__("Google", from_code, to_code)
+        self.from_code = gmap.get(from_code.lower(), from_code) if from_code else "auto"
+        self.to_code = gmap.get(to_code.lower(), to_code)
+        self._endpoint_idx = 0
+        self._header_idx = 0
+
+        # Initialize session with cookies by visiting the main page
+        try:
+            self.session.get("https://translate.google.com/", timeout=5)
+        except Exception:
+            pass
+
+    def translate(self, text):
+        self._wait_rate_limit()
+
+        endpoint = self.ENDPOINTS[self._endpoint_idx]
+        self._endpoint_idx = (self._endpoint_idx + 1) % len(self.ENDPOINTS)
+
+        headers = self.HEADERS[self._header_idx].copy()
+        self._header_idx = (self._header_idx + 1) % len(self.HEADERS)
+
+        params = {
+            "client": "gtx",
+            "sl": self.from_code,
+            "tl": self.to_code,
+            "dt": "t",
+            "q": text,
+        }
+
+        try:
+            response = self.session.get(
+                endpoint, params=params, headers=headers, timeout=8
+            )
+
+            # Check for rate limiting FIRST — don't retry, just raise
+            if response.status_code == 429:
+                raise RateLimitError(f"Google returned 429")
+
+            if response.status_code == 503:
+                raise ServiceError(f"Google returned 503 (service unavailable)")
+
+            response.raise_for_status()
+
+            # Check content type — Google sometimes returns HTML on errors
+            content_type = response.headers.get("Content-Type", "")
+            if "json" not in content_type:
+                raise ServiceError(f"Google returned non-JSON response")
+
+            data = response.json()
+            if not data or not data[0]:
+                raise ServiceError("Google returned empty response")
+
+            # Parse: [[["translated", "original", ...], ...], ...]
+            translated_parts = []
+            for part in data[0]:
+                if part and len(part) > 0:
+                    translated_parts.append(str(part[0]))
+
+            result = "".join(translated_parts)
+            if not result.strip():
+                raise ServiceError("Google returned empty translation")
+
+            return result
+
+        except RateLimitError:
+            raise
+        except ServiceError:
+            raise
+        except requests.exceptions.Timeout:
+            raise ServiceError("Google timeout")
+        except Exception as e:
+            raise ServiceError(f"Google error: {e}")
+
+
+# ==================== TRANSLATION MANAGER ====================
+
+class TranslationManager:
+    """
+    Manages multiple translation services with automatic fallback.
+    Tries services in order. On failure (429, timeout, error),
+    immediately falls back to the next service.
+    Circuit breaker prevents hammering a failing service.
+    """
+
+    def __init__(self, from_code, to_code, service_order=None):
         self.from_code = from_code
         self.to_code = to_code
-        self._ready = False
+        self.cache = TranslationCache(CACHE_SIZE)
 
-    def _ensure_ready(self):
-        if self._ready:
-            return
-        try:
-            import argostranslate.package
-            import argostranslate.translate
-        except ImportError:
-            raise RuntimeError(
-                "Argos Translate not installed. Run: pip3 install argostranslate"
-            )
-        print(f"[Argos] Checking language package {self.from_code} → {self.to_code} …")
-        argostranslate.package.update_package_index()
-        available = argostranslate.package.get_available_packages()
-        pkg = next(
-            (p for p in available if p.from_code == self.from_code and p.to_code == self.to_code),
-            None,
-        )
-        if not pkg:
-            raise RuntimeError(
-                f"No Argos package for {self.from_code} → {self.to_code}. "
-                f"Visit https://github.com/argosopentech/argos-translate for available languages."
-            )
-        argostranslate.package.install_from_path(pkg.download())
-        self._ready = True
-        print("[Argos] Package ready.")
+        if service_order is None:
+            service_order = TRANSLATION_SERVICES
 
-    def translate(self, text: str) -> str:
-        self._ensure_ready()
-        import argostranslate.translate
-        return argostranslate.translate.translate(text, self.from_code, self.to_code)
+        # Build service instances
+        self.services = {}
+        for name in service_order:
+            if name == "mymemory":
+                self.services["mymemory"] = MyMemoryTranslator(from_code, to_code)
+            elif name == "google":
+                self.services["google"] = GoogleTranslator(from_code, to_code)
 
+        self.order = [s for s in service_order if s in self.services]
 
-class LibreTranslator(TranslatorBase):
-    """Online translation using a LibreTranslate instance."""
-    def __init__(self, url: str, from_lang: str, to_lang: str, api_key: str = None):
-        self.url = url
-        self.from_lang = from_lang
-        self.to_lang = to_lang
-        self.api_key = api_key
+        print(f"[Translation] Services: {' → '.join(self.order)}")
+        print(f"[Translation] Rate limit: {MIN_DELAY}-{MAX_DELAY}s per service")
+        print(f"[Translation] Circuit breaker: {MAX_FAILURES} failures → {CIRCUIT_RESET}s cooldown")
+        print(f"[Translation] Cache: {CACHE_SIZE} entries")
 
-    def translate(self, text: str) -> str:
-        try:
-            import requests
-        except ImportError:
-            raise RuntimeError("requests not installed. Run: pip3 install requests")
-        payload = {
-            "q": text,
-            "source": self.from_lang,
-            "target": self.to_lang,
-            "format": "text",
-        }
-        if self.api_key:
-            payload["api_key"] = self.api_key
-        r = requests.post(self.url, data=payload, timeout=10)
-        r.raise_for_status()
-        return r.json()["translatedText"]
+    def translate(self, text):
+        """Translate with fallback chain."""
+        if not text or not text.strip():
+            return text
 
+        # Skip very short text
+        if len(text.strip()) < 2:
+            return text
 
-class DeepLTranslator(TranslatorBase):
-    """Online translation using DeepL API."""
-    def __init__(self, api_key: str, target_lang: str):
-        self.api_key = api_key
-        self.target_lang = target_lang.upper()
-        self.url = "https://api-free.deepl.com/v2/translate"
+        # Check cache
+        cache_key = f"{self.from_code}:{self.to_code}:{text}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
 
-    def translate(self, text: str) -> str:
-        if not self.api_key:
-            raise RuntimeError("DeepL API key is empty. Set DEEPL_API_KEY in the script.")
-        try:
-            import requests
-        except ImportError:
-            raise RuntimeError("requests not installed. Run: pip3 install requests")
-        r = requests.post(
-            self.url,
-            headers={"Authorization": f"DeepL-Auth-Key {self.api_key}"},
-            data={"text": text, "target_lang": self.target_lang},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json()["translations"][0]["text"]
+        # Try each service in order
+        for service_name in self.order:
+            service = self.services[service_name]
 
-class GoogleTranslator(TranslatorBase):
-    def __init__(self, from_code: str, to_code: str):
-        # Map VOSK keys → Google Translate codes
-        gmap = {"zh": "zh-CN", "zh-cn": "zh-CN", "zh-tw": "zh-TW"}
-        self.from_code = gmap.get(from_code.lower(), from_code)
-        self.to_code = gmap.get(to_code.lower(), to_code)
-        self._translator = None
+            # Check circuit breaker
+            if not service.is_available():
+                continue
 
-    def translate(self, text: str) -> str:
-        if not self._translator:
             try:
-                from deep_translator import GoogleTranslator as GT
-            except ImportError:
-                raise RuntimeError(
-                    "deep-translator not installed. Run: pip3 install deep-translator"
-                )
-            # deep-translator accepts "auto" as source for auto-detection
-            source = self.from_code if self.from_code else "auto"
-            self._translator = GT(source=source, target=self.to_code)
-        return self._translator.translate(text)
+                result = service.translate(text)
+                if result and result.strip():
+                    service.record_success()
+                    self.cache.set(cache_key, result)
+                    return result
+                else:
+                    raise ServiceError(f"{service_name} returned empty")
 
+            except RateLimitError:
+                service.record_failure()
+                print(f"  [{service_name}] 429 rate limited → trying next service")
+                continue
 
-def make_translator(engine, from_code, to_code):
-    if to_code is None or engine == "none":
-        return None
-    if engine == "argos":
-        return ArgosTranslator(from_code, to_code)
-    if engine == "libre":
-        return LibreTranslator(LIBRETRANSLATE_URL, from_code, to_code)
-    if engine == "deepl":
-        return DeepLTranslator(DEEPL_API_KEY, to_code)
-    if engine == "google":
-        return GoogleTranslator(from_code, to_code)
-    raise ValueError(f"Unknown translator engine: {engine}")
+            except ServiceError as e:
+                service.record_failure()
+                print(f"  [{service_name}] {e} → trying next service")
+                continue
+
+            except Exception as e:
+                service.record_failure()
+                print(f"  [{service_name}] Unexpected: {e} → trying next service")
+                continue
+
+        # All services failed
+        print(f"  [Translation] ALL services failed for: {text[:40]}...")
+        return text
 
 
 # ==================== APP ====================
@@ -232,13 +410,19 @@ class LiveCaptionApp:
         self.text_queue = queue.Queue()
         self.translation_queue = queue.Queue()
 
+        # Track pending translations to avoid duplicates
+        self.pending_translations = set()
+        self._pending_lock = threading.Lock()
+
         self.caption_lines = []
         self.current_partial = ""
         self.last_speech_time = time.time()
 
-        self.translator = make_translator(TRANSLATOR_ENGINE, translate_from, translate_to)
-        if self.translator:
-            print(f"[Translation] Enabled: {translate_from} → {translate_to} ({TRANSLATOR_ENGINE})")
+        # Create translator
+        self.translator = None
+        if translate_to:
+            self.translator = TranslationManager(translate_from, translate_to)
+            print(f"[Translation] Enabled: {translate_from} → {translate_to}")
 
         self._build_ui()
         self._apply_appearance()
@@ -290,14 +474,12 @@ class LiveCaptionApp:
     def _build_ui(self):
         self.root = tk.Tk()
         self.root.title("Live Captions")
-        self.root.withdraw()                      # <-- ADD THIS: hide until fully configured
+        self.root.withdraw()
 
-        # Frameless, always on top
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.caption_font = tkfont.Font(family=FONT_FAMILY, size=FONT_SIZE, weight=FONT_WEIGHT)
 
-        # Side-by-side grid: MAX_LINES rows × 2 columns
         self.caption_frame = tk.Frame(self.root, bg=BG_COLOR)
         self.caption_frame.pack(expand=True, fill="both", padx=20, pady=10)
 
@@ -306,58 +488,37 @@ class LiveCaptionApp:
 
         for i in range(MAX_LINES):
             left = tk.Label(
-                self.caption_frame,
-                text="",
-                font=self.caption_font,
-                bg=BG_COLOR,
-                fg=FG_COLOR,
-                anchor="w",
-                justify="left",
+                self.caption_frame, text="", font=self.caption_font,
+                bg=BG_COLOR, fg=FG_COLOR, anchor="w", justify="left",
             )
             left.grid(row=i, column=0, sticky="nsew", padx=(0, 10))
 
             right = tk.Label(
-                self.caption_frame,
-                text="",
-                font=self.caption_font,
-                bg=BG_COLOR,
-                fg=FG_COLOR,
-                anchor="w",
-                justify="left",
+                self.caption_frame, text="", font=self.caption_font,
+                bg=BG_COLOR, fg=FG_COLOR, anchor="w", justify="left",
             )
             right.grid(row=i, column=1, sticky="nsew", padx=(10, 0))
 
             self.left_labels.append(left)
             self.right_labels.append(right)
 
-        # Lock both columns to exactly equal width regardless of content
         self.caption_frame.grid_columnconfigure(0, weight=1, uniform="col")
         self.caption_frame.grid_columnconfigure(1, weight=1, uniform="col")
 
-        # Drag to move
         self.root.bind("<Button-1>", self._start_drag)
         self.root.bind("<B1-Motion>", self._on_drag)
-
-        # Right-click menu
         self.root.bind("<Button-3>", self._show_menu)
         self.menu = tk.Menu(
-            self.root,
-            tearoff=0,
-            bg="#2d2d2d",
-            fg="#ffffff",
-            activebackground="#444444",
-            activeforeground="#ffffff",
+            self.root, tearoff=0, bg="#2d2d2d", fg="#ffffff",
+            activebackground="#444444", activeforeground="#ffffff",
         )
         self.menu.add_command(label="Increase Font", command=self._increase_font)
         self.menu.add_command(label="Decrease Font", command=self._decrease_font)
         self.menu.add_separator()
         self.menu.add_command(label="Exit", command=self.shutdown)
-
-        # Keyboard shortcut
         self.root.bind("<Escape>", lambda e: self.shutdown())
 
     def _set_status(self, text):
-        """Show a status message across all rows (used during init)."""
         for i in range(MAX_LINES):
             if i == MAX_LINES // 2:
                 self.left_labels[i].config(text=text)
@@ -366,12 +527,10 @@ class LiveCaptionApp:
             self.right_labels[i].config(text="")
 
     def _apply_appearance(self):
-        # Calculate scaled size
         scale = WINDOW_SIZE_PERCENT / 100.0
         w = int(BASE_WIDTH * scale)
         h = int(BASE_HEIGHT * scale)
 
-        # Center at bottom of screen
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         x = (sw - w) // 2
@@ -381,15 +540,10 @@ class LiveCaptionApp:
         self.root.configure(bg=BG_COLOR)
         self.caption_frame.configure(bg=BG_COLOR)
 
-        # --- OPACITY FIX for Cinnamon / X11 ---
-        # Frameless windows must be mapped by the compositor before -alpha works.
-        # We withdraw in _build_ui, do all setup, then deiconify and wait.
         self.root.deiconify()
         self.root.wait_visibility()
         self.root.attributes("-alpha", WINDOW_OPACITY)
-        # ---------------------------------------
 
-        # Update wraplengths to fit half the window width
         col_width = max(200, (w - 100) // 2)
         for i in range(MAX_LINES):
             self.left_labels[i].config(wraplength=col_width, bg=BG_COLOR, fg=FG_COLOR)
@@ -468,7 +622,10 @@ class LiveCaptionApp:
                     if text:
                         self.text_queue.put(("final", text))
                         if self.translator:
-                            self.translation_queue.put(text)
+                            with self._pending_lock:
+                                if text not in self.pending_translations:
+                                    self.pending_translations.add(text)
+                                    self.translation_queue.put(text)
                 else:
                     partial = json.loads(self.recognizer.PartialResult())
                     text = partial.get("partial", "").strip()
@@ -484,12 +641,25 @@ class LiveCaptionApp:
         while self.running:
             try:
                 text = self.translation_queue.get(timeout=0.5)
+
+                if len(text.strip()) < 2:
+                    with self._pending_lock:
+                        self.pending_translations.discard(text)
+                    continue
+
                 translated = self.translator.translate(text)
+
+                with self._pending_lock:
+                    self.pending_translations.discard(text)
+
                 self.text_queue.put(("translated", (text, translated)))
+
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"Translation error: {e}")
+                print(f"Translation worker error: {e}")
+                with self._pending_lock:
+                    pass
 
     # -------------------- Display --------------------
     def _update_caption(self):
@@ -511,7 +681,6 @@ class LiveCaptionApp:
                 elif kind == "translated":
                     self.current_partial = ""
                     source, translated = payload
-                    # Replace the most recent matching source line with a tuple
                     for i in range(len(self.caption_lines) - 1, -1, -1):
                         if self.caption_lines[i] == source:
                             self.caption_lines[i] = (source, translated)
@@ -527,7 +696,6 @@ class LiveCaptionApp:
             self.root.after(100, self._update_caption)
 
     def _render(self):
-        # Build row tuples: (original, translated_or_empty)
         rows = []
         for item in self.caption_lines:
             if isinstance(item, tuple):
@@ -542,7 +710,6 @@ class LiveCaptionApp:
         if not rows:
             rows.append(("Listening…", ""))
 
-        # Keep only the last MAX_LINES rows
         start = max(0, len(rows) - MAX_LINES)
         display = rows[start:]
 
@@ -597,12 +764,6 @@ def list_sources():
 
 
 def parse_mode(mode_str):
-    """
-    Parse --mode string.
-    Format: SOURCE-TARGET  (e.g., 'zh-en', 'en-us-es')
-            or just SOURCE (e.g., 'es' for no translation)
-    Splits on the LAST hyphen so locale codes like 'en-us' work as source keys.
-    """
     if "-" in mode_str:
         source, target = mode_str.rsplit("-", 1)
         return source, target
@@ -612,17 +773,11 @@ def parse_mode(mode_str):
 def main():
     parser = argparse.ArgumentParser(description="Live Caption Generator for Linux")
     parser.add_argument(
-        "--mode",
-        default="en",
-        help="Language mode: SOURCE-TARGET (e.g., 'zh-en', 'es-en') or just SOURCE (e.g., 'en'). "
-             "Source must be a key in VOSK_MODELS. Target is the translation language.",
+        "--mode", default="en",
+        help="Language mode: SOURCE-TARGET (e.g., 'ru-en', 'es-en') or just SOURCE (e.g., 'en').",
     )
-    parser.add_argument(
-        "-d", "--device", help="PulseAudio source name (default: monitor of default sink)"
-    )
-    parser.add_argument(
-        "--list-devices", action="store_true", help="List audio sources and exit"
-    )
+    parser.add_argument("-d", "--device", help="PulseAudio source name")
+    parser.add_argument("--list-devices", action="store_true", help="List audio sources and exit")
     args = parser.parse_args()
 
     if args.list_devices:
@@ -631,7 +786,6 @@ def main():
 
     source_lang, target_lang = parse_mode(args.mode)
 
-    # Validate source language key
     model_path = VOSK_MODELS.get(source_lang)
     if not model_path:
         print(f"Error: No VOSK model configured for language key '{source_lang}'.")
@@ -653,3 +807,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
