@@ -100,17 +100,6 @@ All customization is done by editing the **"CUSTOMIZE THESE"** section in `live_
 
 **Note:** Opacity may not work on all window managers 
 
-### Colors & Font
-
-| Option | Default | Purpose | Example |
-|---|---|---|---|
-| `BG_COLOR` | `"#1a1a1a"` | Background color (hex code) | `"#000000"` for pure black |
-| `FG_COLOR` | `"#ffffff"` | Text/foreground color (hex code) | `"#ffff00"` for yellow |
-| `FONT_FAMILY` | `"Noto Sans"` | Font name | `"Liberation Sans"`, `"DejaVu Sans"` |
-| `FONT_SIZE` | `10` | Font size in points | `14`, `16` |
-| `FONT_WEIGHT` | `"bold"` | Font weight | `"normal"` or `"bold"` |
-
-
 ---
 
 ### Caption Behavior
