@@ -1,17 +1,14 @@
-```python
 #!/usr/bin/env python3
 """
-Live Caption Generator for Linux
+Live Caption Generator for Linux 
 Captures system audio output and transcribes in real-time using VOSK.
-Optional real-time translation with multi-service fallback chain.
-Side-by-side layout.
+Optional real-time translation. Side-by-side scrollable layout.
 """
 
 import argparse
 import json
 import os
 import queue
-import random
 import subprocess
 import sys
 import threading
@@ -31,371 +28,62 @@ except ImportError:
     print("Missing dependency: vosk  (pip3 install vosk)")
     sys.exit(1)
 
-try:
-    import requests
-except ImportError:
-    print("Missing dependency: requests  (pip3 install requests)")
-    sys.exit(1)
+from caption_translators import SmartCaptionTranslator
 
 
 # ==================== CUSTOMIZE THESE ====================
+# Base window size (pixels)
 BASE_WIDTH = 1400
-BASE_HEIGHT = 150
+BASE_HEIGHT = 220
+
+# Scale the window size (100 = base size, 150 = 1.5x, 50 = half size)
 WINDOW_SIZE_PERCENT = 70
+
+# Window opacity: 0.1 (very transparent) to 1.0 (fully opaque)
 WINDOW_OPACITY = 0.93
+
+# Colors
 BG_COLOR = "#1a1a1a"
 FG_COLOR = "#ffffff"
+
+# Font
 FONT_FAMILY = "Noto Sans"
 FONT_SIZE = 10
-FONT_WEIGHT = "bold"
-MAX_LINES = 3
-FADE_AFTER_SECONDS = 15
+FONT_WEIGHT = "bold"  # "normal" or "bold"
 
+# Scrollback buffer limit (lines). Older lines are trimmed automatically.
+MAX_BUFFER_LINES = 500
+
+# If True, hides the source-text pane and halves the window width.
+# Only translated text appears in the scrollback.
+SHOW_ONLY_TRANSLATION = True
+
+# -------------------- VOSK MODEL PATHS --------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 VOSK_MODELS = {
-    "ru": "/path/to/vosk/medel/vosk-model-small-ru-0.22",
-    "zh": "/path/to/vosk/medel/vosk-model-small-cn-0.22",
-    "es": "/path/to/vosk/medel/vosk-model-small-es-0.42",
-    "ar": "/path/to/vosk/medel/vosk-model-ar-mgb2-0.4",
+    "ru": "/path/to/vosk/model/vosk-model-small-ru-0.22",
+    "zh": "/path/to/vosk/model/vosk-model-small-cn-0.22",
+    "es": "/path/to/vosk/model/vosk-model-small-es-0.42",
+    "ar": "/path/to/vosk/model/vosk-model-ar-mgb2-0.4",
 }
 
-# ==================== TRANSLATION CONFIG ====================
-# Services to use, in order of preference.
-# MyMemory is the primary, Google is the fallback.
-TRANSLATION_SERVICES = ["mymemory", "google"]
-
-# Per-service rate limiting (seconds between requests to the SAME service)
-MIN_DELAY = 1.0
-MAX_DELAY = 2.5
-
-# Circuit breaker: after this many consecutive failures, stop trying the service
-# for CIRCUIT_RESET seconds, then try again.
-MAX_FAILURES = 3
-CIRCUIT_RESET = 60  # seconds
-
-# Cache
-CACHE_SIZE = 500
+# -------------------- TRANSLATION --------------------
+# "google" uses SmartCaptionTranslator (Google/Bing/Yandex fallback)
+# "none" disables translation
+TRANSLATOR_ENGINE = "google"
+# =======================================================
 
 SAMPLE_RATE = 16000
 CHUNK_BYTES = 4096
 
 
-# ==================== ERROR CLASSES ====================
-
-class TranslationError(Exception):
-    """Base translation error."""
-    pass
-
-class RateLimitError(TranslationError):
-    """Service returned 429 or equivalent."""
-    pass
-
-class ServiceError(TranslationError):
-    """Service returned an error."""
-    pass
-
-
-# ==================== CACHE ====================
-
-class TranslationCache:
-    """Thread-safe cache for translations."""
-
-    def __init__(self, max_size=500):
-        self.max_size = max_size
-        self._cache = {}
-        self._lock = threading.Lock()
-
-    def get(self, key):
-        with self._lock:
-            return self._cache.get(key)
-
-    def set(self, key, value):
-        with self._lock:
-            if len(self._cache) >= self.max_size:
-                oldest = next(iter(self._cache))
-                del self._cache[oldest]
-            self._cache[key] = value
-
-
-# ==================== TRANSLATION SERVICES ====================
-
-class TranslationService:
-    """Base class for translation services with circuit breaker."""
-
-    def __init__(self, name, from_code, to_code):
-        self.name = name
-        self.from_code = from_code
-        self.to_code = to_code
-        self.session = requests.Session()
-        # NO automatic retries — we handle everything manually
-        self.failure_count = 0
-        self.circuit_open_until = 0
-        self.last_request_time = 0
-        self._lock = threading.Lock()
-
-    def is_available(self):
-        """Check if circuit breaker allows this service."""
-        if time.time() < self.circuit_open_until:
-            remaining = self.circuit_open_until - time.time()
-            return False
-        return True
-
-    def _wait_rate_limit(self):
-        """Enforce per-service rate limiting."""
-        with self._lock:
-            now = time.time()
-            elapsed = now - self.last_request_time
-            delay = random.uniform(MIN_DELAY, MAX_DELAY)
-            if elapsed < delay:
-                time.sleep(delay - elapsed)
-            self.last_request_time = time.time()
-
-    def record_success(self):
-        """Reset failure count on success."""
-        self.failure_count = 0
-        self.circuit_open_until = 0
-
-    def record_failure(self):
-        """Increment failure count and maybe open circuit."""
-        self.failure_count += 1
-        if self.failure_count >= MAX_FAILURES:
-            self.circuit_open_until = time.time() + CIRCUIT_RESET
-            print(f"  [{self.name}] Circuit breaker OPEN for {CIRCUIT_RESET}s "
-                  f"(failures: {self.failure_count})")
-
-    def translate(self, text):
-        """Override in subclass."""
-        raise NotImplementedError
-
-
-class MyMemoryTranslator(TranslationService):
-    """MyMemory translation API — free, 5000 words/day without key."""
-
-    def __init__(self, from_code, to_code):
-        super().__init__("MyMemory", from_code, to_code)
-        self.url = "https://api.mymemory.translated.net/get"
-
-    def translate(self, text):
-        self._wait_rate_limit()
-
-        params = {
-            "q": text,
-            "langpair": f"{self.from_code}|{self.to_code}",
-        }
-
-        try:
-            response = self.session.get(self.url, params=params, timeout=8)
-
-            if response.status_code == 429:
-                raise RateLimitError("MyMemory returned 429")
-
-            response.raise_for_status()
-            data = response.json()
-
-            # Check for errors in response
-            status = data.get("responseStatus", 200)
-            if status != 200:
-                raise ServiceError(f"MyMemory error: status={status}")
-
-            translated = data.get("responseData", {}).get("translatedText", "")
-            if not translated:
-                raise ServiceError("MyMemory returned empty translation")
-
-            return translated
-
-        except RateLimitError:
-            raise
-        except ServiceError:
-            raise
-        except Exception as e:
-            raise ServiceError(f"MyMemory error: {e}")
-
-
-class GoogleTranslator(TranslationService):
-    """Google Translate free web endpoint."""
-
-    # Rotate between endpoints
-    ENDPOINTS = [
-        "https://translate.google.com/translate_a/single",
-        "https://translate.googleapis.com/translate_a/single",
-    ]
-
-    HEADERS = [
-        {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Referer": "https://translate.google.com/",
-        },
-        {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Referer": "https://translate.google.com/",
-        },
-    ]
-
-    def __init__(self, from_code, to_code):
-        gmap = {"zh": "zh-CN", "zh-cn": "zh-CN", "zh-tw": "zh-TW"}
-        super().__init__("Google", from_code, to_code)
-        self.from_code = gmap.get(from_code.lower(), from_code) if from_code else "auto"
-        self.to_code = gmap.get(to_code.lower(), to_code)
-        self._endpoint_idx = 0
-        self._header_idx = 0
-
-        # Initialize session with cookies by visiting the main page
-        try:
-            self.session.get("https://translate.google.com/", timeout=5)
-        except Exception:
-            pass
-
-    def translate(self, text):
-        self._wait_rate_limit()
-
-        endpoint = self.ENDPOINTS[self._endpoint_idx]
-        self._endpoint_idx = (self._endpoint_idx + 1) % len(self.ENDPOINTS)
-
-        headers = self.HEADERS[self._header_idx].copy()
-        self._header_idx = (self._header_idx + 1) % len(self.HEADERS)
-
-        params = {
-            "client": "gtx",
-            "sl": self.from_code,
-            "tl": self.to_code,
-            "dt": "t",
-            "q": text,
-        }
-
-        try:
-            response = self.session.get(
-                endpoint, params=params, headers=headers, timeout=8
-            )
-
-            # Check for rate limiting FIRST — don't retry, just raise
-            if response.status_code == 429:
-                raise RateLimitError(f"Google returned 429")
-
-            if response.status_code == 503:
-                raise ServiceError(f"Google returned 503 (service unavailable)")
-
-            response.raise_for_status()
-
-            # Check content type — Google sometimes returns HTML on errors
-            content_type = response.headers.get("Content-Type", "")
-            if "json" not in content_type:
-                raise ServiceError(f"Google returned non-JSON response")
-
-            data = response.json()
-            if not data or not data[0]:
-                raise ServiceError("Google returned empty response")
-
-            # Parse: [[["translated", "original", ...], ...], ...]
-            translated_parts = []
-            for part in data[0]:
-                if part and len(part) > 0:
-                    translated_parts.append(str(part[0]))
-
-            result = "".join(translated_parts)
-            if not result.strip():
-                raise ServiceError("Google returned empty translation")
-
-            return result
-
-        except RateLimitError:
-            raise
-        except ServiceError:
-            raise
-        except requests.exceptions.Timeout:
-            raise ServiceError("Google timeout")
-        except Exception as e:
-            raise ServiceError(f"Google error: {e}")
-
-
-# ==================== TRANSLATION MANAGER ====================
-
-class TranslationManager:
-    """
-    Manages multiple translation services with automatic fallback.
-    Tries services in order. On failure (429, timeout, error),
-    immediately falls back to the next service.
-    Circuit breaker prevents hammering a failing service.
-    """
-
-    def __init__(self, from_code, to_code, service_order=None):
-        self.from_code = from_code
-        self.to_code = to_code
-        self.cache = TranslationCache(CACHE_SIZE)
-
-        if service_order is None:
-            service_order = TRANSLATION_SERVICES
-
-        # Build service instances
-        self.services = {}
-        for name in service_order:
-            if name == "mymemory":
-                self.services["mymemory"] = MyMemoryTranslator(from_code, to_code)
-            elif name == "google":
-                self.services["google"] = GoogleTranslator(from_code, to_code)
-
-        self.order = [s for s in service_order if s in self.services]
-
-        print(f"[Translation] Services: {' → '.join(self.order)}")
-        print(f"[Translation] Rate limit: {MIN_DELAY}-{MAX_DELAY}s per service")
-        print(f"[Translation] Circuit breaker: {MAX_FAILURES} failures → {CIRCUIT_RESET}s cooldown")
-        print(f"[Translation] Cache: {CACHE_SIZE} entries")
-
-    def translate(self, text):
-        """Translate with fallback chain."""
-        if not text or not text.strip():
-            return text
-
-        # Skip very short text
-        if len(text.strip()) < 2:
-            return text
-
-        # Check cache
-        cache_key = f"{self.from_code}:{self.to_code}:{text}"
-        cached = self.cache.get(cache_key)
-        if cached:
-            return cached
-
-        # Try each service in order
-        for service_name in self.order:
-            service = self.services[service_name]
-
-            # Check circuit breaker
-            if not service.is_available():
-                continue
-
-            try:
-                result = service.translate(text)
-                if result and result.strip():
-                    service.record_success()
-                    self.cache.set(cache_key, result)
-                    return result
-                else:
-                    raise ServiceError(f"{service_name} returned empty")
-
-            except RateLimitError:
-                service.record_failure()
-                print(f"  [{service_name}] 429 rate limited → trying next service")
-                continue
-
-            except ServiceError as e:
-                service.record_failure()
-                print(f"  [{service_name}] {e} → trying next service")
-                continue
-
-            except Exception as e:
-                service.record_failure()
-                print(f"  [{service_name}] Unexpected: {e} → trying next service")
-                continue
-
-        # All services failed
-        print(f"  [Translation] ALL services failed for: {text[:40]}...")
-        return text
+# ==================== TRANSLATOR FACTORY ====================
+
+def make_translator(engine, from_code, to_code):
+    if to_code is None or engine == "none":
+        return None
+    return SmartCaptionTranslator(from_code, to_code)
 
 
 # ==================== APP ====================
@@ -410,19 +98,18 @@ class LiveCaptionApp:
         self.text_queue = queue.Queue()
         self.translation_queue = queue.Queue()
 
-        # Track pending translations to avoid duplicates
-        self.pending_translations = set()
-        self._pending_lock = threading.Lock()
-
-        self.caption_lines = []
+        self.caption_entries = []   # {"source": str, "translated": str|None}
         self.current_partial = ""
         self.last_speech_time = time.time()
 
-        # Create translator
-        self.translator = None
-        if translate_to:
-            self.translator = TranslationManager(translate_from, translate_to)
-            print(f"[Translation] Enabled: {translate_from} → {translate_to}")
+        # Sentence buffering state
+        self._sentence_buffer = ""
+        self._sentence_lock = threading.Lock()
+        self._sentence_timer = None
+
+        self.translator = make_translator(TRANSLATOR_ENGINE, translate_from, translate_to)
+        if self.translator:
+            print(f"[Translation] Enabled: {translate_from} -> {translate_to} ({TRANSLATOR_ENGINE})")
 
         self._build_ui()
         self._apply_appearance()
@@ -468,7 +155,6 @@ class LiveCaptionApp:
 
         # GUI loops
         self.root.after(100, self._update_caption)
-        self._schedule_fade_check()
 
     # -------------------- UI --------------------
     def _build_ui(self):
@@ -476,59 +162,152 @@ class LiveCaptionApp:
         self.root.title("Live Captions")
         self.root.withdraw()
 
+        # Frameless, always on top
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
+
         self.caption_font = tkfont.Font(family=FONT_FAMILY, size=FONT_SIZE, weight=FONT_WEIGHT)
+        self.partial_font = tkfont.Font(
+            family=FONT_FAMILY, size=FONT_SIZE, weight="normal", slant="italic"
+        )
 
-        self.caption_frame = tk.Frame(self.root, bg=BG_COLOR)
-        self.caption_frame.pack(expand=True, fill="both", padx=20, pady=10)
+        # Main container
+        main_frame = tk.Frame(self.root, bg=BG_COLOR)
+        main_frame.pack(expand=True, fill="both")
 
-        self.left_labels = []
-        self.right_labels = []
+        # ---- Scrollable text area ----
+        text_frame = tk.Frame(main_frame, bg=BG_COLOR)
+        text_frame.pack(expand=True, fill="both", padx=10, pady=(10, 0))
 
-        for i in range(MAX_LINES):
-            left = tk.Label(
-                self.caption_frame, text="", font=self.caption_font,
-                bg=BG_COLOR, fg=FG_COLOR, anchor="w", justify="left",
+        self.left_text = tk.Text(
+            text_frame,
+            font=self.caption_font,
+            bg=BG_COLOR,
+            fg=FG_COLOR,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            padx=5,
+            pady=5,
+            height=6,
+            spacing1=2,
+            spacing3=2,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.right_text = tk.Text(
+            text_frame,
+            font=self.caption_font,
+            bg=BG_COLOR,
+            fg=FG_COLOR,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            padx=5,
+            pady=5,
+            height=6,
+            spacing1=2,
+            spacing3=2,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.scrollbar = tk.Scrollbar(text_frame, command=self._on_scrollbar)
+
+        if SHOW_ONLY_TRANSLATION:
+            # Single pane: translation only
+            self.right_text.grid(row=0, column=0, sticky="nsew")
+            self.scrollbar.grid(row=0, column=1, sticky="ns")
+            self.right_text.config(yscrollcommand=self.scrollbar.set)
+            text_frame.grid_columnconfigure(0, weight=1)
+        else:
+            # Dual pane: source + translation
+            self.left_text.grid(row=0, column=0, sticky="nsew")
+            self.right_text.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+            self.scrollbar.grid(row=0, column=2, sticky="ns")
+            self.left_text.config(yscrollcommand=self._on_text_scroll)
+            self.right_text.config(yscrollcommand=self._on_text_scroll)
+            text_frame.grid_columnconfigure(0, weight=1, uniform="col")
+            text_frame.grid_columnconfigure(1, weight=1, uniform="col")
+
+        # Mousewheel scroll
+        scroll_widgets = [self.right_text, text_frame] if SHOW_ONLY_TRANSLATION else [self.left_text, self.right_text, text_frame]
+        for w in scroll_widgets:
+            w.bind("<MouseWheel>", self._on_mousewheel)
+            w.bind("<Button-4>", self._on_mousewheel)
+            w.bind("<Button-5>", self._on_mousewheel)
+
+        # ---- Live partial indicator (bottom) ----
+        partial_frame = tk.Frame(main_frame, bg=BG_COLOR)
+        partial_frame.pack(fill="x", padx=10, pady=(5, 10))
+
+        self.partial_left = tk.Label(
+            partial_frame,
+            text="",
+            font=self.partial_font,
+            bg=BG_COLOR,
+            fg="#aaaaaa",
+            anchor="w",
+            justify="left",
+        )
+        self.partial_left.pack(side=tk.LEFT, expand=True, fill="x")
+
+        if not SHOW_ONLY_TRANSLATION:
+            self.partial_right = tk.Label(
+                partial_frame,
+                text="",
+                font=self.partial_font,
+                bg=BG_COLOR,
+                fg="#888888",
+                anchor="w",
+                justify="left",
             )
-            left.grid(row=i, column=0, sticky="nsew", padx=(0, 10))
+            self.partial_right.pack(side=tk.RIGHT, expand=True, fill="x", padx=(5, 0))
 
-            right = tk.Label(
-                self.caption_frame, text="", font=self.caption_font,
-                bg=BG_COLOR, fg=FG_COLOR, anchor="w", justify="left",
-            )
-            right.grid(row=i, column=1, sticky="nsew", padx=(10, 0))
+        # Drag to move
+        for w in (self.root, main_frame, partial_frame):
+            w.bind("<Button-1>", self._start_drag)
+            w.bind("<B1-Motion>", self._on_drag)
 
-            self.left_labels.append(left)
-            self.right_labels.append(right)
+        # Right-click menu
+        menu_widgets = [self.root, main_frame, text_frame, partial_frame,
+                        self.left_text, self.right_text, self.partial_left]
+        if not SHOW_ONLY_TRANSLATION:
+            menu_widgets.append(self.partial_right)
+        for w in menu_widgets:
+            w.bind("<Button-3>", self._show_menu)
 
-        self.caption_frame.grid_columnconfigure(0, weight=1, uniform="col")
-        self.caption_frame.grid_columnconfigure(1, weight=1, uniform="col")
-
-        self.root.bind("<Button-1>", self._start_drag)
-        self.root.bind("<B1-Motion>", self._on_drag)
-        self.root.bind("<Button-3>", self._show_menu)
         self.menu = tk.Menu(
-            self.root, tearoff=0, bg="#2d2d2d", fg="#ffffff",
-            activebackground="#444444", activeforeground="#ffffff",
+            self.root,
+            tearoff=0,
+            bg="#2d2d2d",
+            fg="#ffffff",
+            activebackground="#444444",
+            activeforeground="#ffffff",
         )
         self.menu.add_command(label="Increase Font", command=self._increase_font)
         self.menu.add_command(label="Decrease Font", command=self._decrease_font)
         self.menu.add_separator()
         self.menu.add_command(label="Exit", command=self.shutdown)
+
+        # Keyboard shortcut
         self.root.bind("<Escape>", lambda e: self.shutdown())
 
     def _set_status(self, text):
-        for i in range(MAX_LINES):
-            if i == MAX_LINES // 2:
-                self.left_labels[i].config(text=text)
-            else:
-                self.left_labels[i].config(text="")
-            self.right_labels[i].config(text="")
+        """Show a status message in the text widgets (used during init)."""
+        self.right_text.config(state=tk.NORMAL)
+        self.right_text.delete("1.0", tk.END)
+        self.right_text.insert("1.0", text)
+        self.right_text.config(state=tk.DISABLED)
+        if not SHOW_ONLY_TRANSLATION:
+            self.left_text.config(state=tk.NORMAL)
+            self.left_text.delete("1.0", tk.END)
+            self.left_text.insert("1.0", text)
+            self.left_text.config(state=tk.DISABLED)
 
     def _apply_appearance(self):
         scale = WINDOW_SIZE_PERCENT / 100.0
-        w = int(BASE_WIDTH * scale)
+        if SHOW_ONLY_TRANSLATION:
+            w = int((BASE_WIDTH * scale) / 2)
+        else:
+            w = int(BASE_WIDTH * scale)
         h = int(BASE_HEIGHT * scale)
 
         sw = self.root.winfo_screenwidth()
@@ -538,16 +317,20 @@ class LiveCaptionApp:
 
         self.root.geometry(f"{w}x{h}+{x}+{y}")
         self.root.configure(bg=BG_COLOR)
-        self.caption_frame.configure(bg=BG_COLOR)
 
+        # Opacity fix for Cinnamon / X11
         self.root.deiconify()
         self.root.wait_visibility()
         self.root.attributes("-alpha", WINDOW_OPACITY)
 
-        col_width = max(200, (w - 100) // 2)
-        for i in range(MAX_LINES):
-            self.left_labels[i].config(wraplength=col_width, bg=BG_COLOR, fg=FG_COLOR)
-            self.right_labels[i].config(wraplength=col_width, bg=BG_COLOR, fg=FG_COLOR)
+        # Wraplength for partial labels
+        if SHOW_ONLY_TRANSLATION:
+            col_width = max(200, w - 80)
+        else:
+            col_width = max(200, (w - 100) // 2)
+        self.partial_left.config(wraplength=col_width)
+        if not SHOW_ONLY_TRANSLATION:
+            self.partial_right.config(wraplength=col_width)
 
         try:
             self.caption_font.configure(family=FONT_FAMILY, size=FONT_SIZE, weight=FONT_WEIGHT)
@@ -569,10 +352,41 @@ class LiveCaptionApp:
     def _increase_font(self):
         s = self.caption_font.cget("size")
         self.caption_font.config(size=min(s + 2, 72))
+        self.partial_font.config(size=min(s + 2, 72))
+        self.right_text.config(font=self.caption_font)
+        if not SHOW_ONLY_TRANSLATION:
+            self.left_text.config(font=self.caption_font)
 
     def _decrease_font(self):
         s = self.caption_font.cget("size")
         self.caption_font.config(size=max(s - 2, 8))
+        self.partial_font.config(size=max(s - 2, 8))
+        self.right_text.config(font=self.caption_font)
+        if not SHOW_ONLY_TRANSLATION:
+            self.left_text.config(font=self.caption_font)
+
+    # -------------------- Scroll Sync --------------------
+    def _on_scrollbar(self, *args):
+        self.right_text.yview(*args)
+        if not SHOW_ONLY_TRANSLATION:
+            self.left_text.yview(*args)
+
+    def _on_text_scroll(self, first, last):
+        self.scrollbar.set(first, last)
+        self.right_text.yview_moveto(first)
+        if not SHOW_ONLY_TRANSLATION:
+            self.left_text.yview_moveto(first)
+
+    def _on_mousewheel(self, event):
+        delta = 0
+        if event.num == 4 or getattr(event, "delta", 0) > 0:
+            delta = -3
+        elif event.num == 5 or getattr(event, "delta", 0) < 0:
+            delta = 3
+        self.right_text.yview_scroll(delta, "units")
+        if not SHOW_ONLY_TRANSLATION:
+            self.left_text.yview_scroll(delta, "units")
+        return "break"
 
     # -------------------- Audio & Recognition --------------------
     def _get_default_monitor(self):
@@ -620,46 +434,56 @@ class LiveCaptionApp:
                     result = json.loads(self.recognizer.Result())
                     text = result.get("text", "").strip()
                     if text:
-                        self.text_queue.put(("final", text))
-                        if self.translator:
-                            with self._pending_lock:
-                                if text not in self.pending_translations:
-                                    self.pending_translations.add(text)
-                                    self.translation_queue.put(text)
+                        with self._sentence_lock:
+                            self._sentence_buffer = (self._sentence_buffer + " " + text).strip()
+                            self.last_speech_time = time.time()
+                            if self._sentence_timer:
+                                self._sentence_timer.cancel()
+                            if self._is_sentence_complete(self._sentence_buffer):
+                                self._flush_sentence_buffer()
+                            else:
+                                self._sentence_timer = threading.Timer(1.5, self._flush_sentence_buffer)
+                                self._sentence_timer.start()
                 else:
                     partial = json.loads(self.recognizer.PartialResult())
                     text = partial.get("partial", "").strip()
                     if text:
+                        # Only display partial locally — NEVER translate it
                         self.text_queue.put(("partial", text))
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"Recognition error: {e}")
 
+    def _is_sentence_complete(self, text: str) -> bool:
+        text = text.rstrip()
+        if not text:
+            return False
+        # Sentence-ending punctuation across languages
+        return text[-1] in ".!?…。！？؛؟"
+
+    def _flush_sentence_buffer(self):
+        with self._sentence_lock:
+            text = self._sentence_buffer.strip()
+            self._sentence_buffer = ""
+            self._sentence_timer = None
+        if text:
+            self.text_queue.put(("final", text))
+            if self.translator:
+                self.translation_queue.put(text)
+
     # -------------------- Translation --------------------
     def _translation_worker(self):
+        """Translate FINAL captions only. Partials are too noisy and waste quota."""
         while self.running:
             try:
                 text = self.translation_queue.get(timeout=0.5)
-
-                if len(text.strip()) < 2:
-                    with self._pending_lock:
-                        self.pending_translations.discard(text)
-                    continue
-
                 translated = self.translator.translate(text)
-
-                with self._pending_lock:
-                    self.pending_translations.discard(text)
-
                 self.text_queue.put(("translated", (text, translated)))
-
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"Translation worker error: {e}")
-                with self._pending_lock:
-                    pass
+                print(f"Translation error: {e}")
 
     # -------------------- Display --------------------
     def _update_caption(self):
@@ -670,10 +494,7 @@ class LiveCaptionApp:
                 self.last_speech_time = time.time()
                 if kind == "final":
                     self.current_partial = ""
-                    if payload:
-                        self.caption_lines.append(payload)
-                        if len(self.caption_lines) > MAX_LINES:
-                            self.caption_lines = self.caption_lines[-MAX_LINES:]
+                    self._append_entry(payload, translated=None)
                     changed = True
                 elif kind == "partial":
                     self.current_partial = payload
@@ -681,71 +502,117 @@ class LiveCaptionApp:
                 elif kind == "translated":
                     self.current_partial = ""
                     source, translated = payload
-                    for i in range(len(self.caption_lines) - 1, -1, -1):
-                        if self.caption_lines[i] == source:
-                            self.caption_lines[i] = (source, translated)
-                            break
+                    self._update_translation(source, translated)
                     changed = True
         except queue.Empty:
             pass
 
         if changed:
-            self._render()
+            self._update_partial_display()
 
         if self.running:
             self.root.after(100, self._update_caption)
 
-    def _render(self):
-        rows = []
-        for item in self.caption_lines:
-            if isinstance(item, tuple):
-                source, translated = item
-                rows.append((source, translated))
-            else:
-                rows.append((item, ""))
+    def _append_entry(self, source_text, translated=None):
+        entry = {"source": source_text, "translated": translated}
+        self.caption_entries.append(entry)
+        self._trim_buffer()
 
+        if SHOW_ONLY_TRANSLATION:
+            # Don't show source text. If translation already available, rebuild.
+            if translated:
+                self._rebuild_text_widgets()
+            return
+
+        # Incremental insert for dual-pane mode
+        self.left_text.config(state=tk.NORMAL)
+        self.right_text.config(state=tk.NORMAL)
+
+        if len(self.caption_entries) > 1:
+            self.left_text.insert(tk.END, "\n")
+            self.right_text.insert(tk.END, "\n")
+
+        self.left_text.insert(tk.END, source_text)
+        if translated:
+            self.right_text.insert(tk.END, translated)
+
+        self.left_text.config(state=tk.DISABLED)
+        self.right_text.config(state=tk.DISABLED)
+        self._scroll_to_end()
+
+    def _update_translation(self, source_text, translated_text):
+        # Find the most recent matching entry that hasn't been translated yet
+        for i in range(len(self.caption_entries) - 1, -1, -1):
+            if self.caption_entries[i]["source"] == source_text and self.caption_entries[i]["translated"] is None:
+                self.caption_entries[i]["translated"] = translated_text
+                self._rebuild_text_widgets()
+                break
+
+    def _rebuild_text_widgets(self):
+        if not SHOW_ONLY_TRANSLATION:
+            self.left_text.config(state=tk.NORMAL)
+            self.left_text.delete("1.0", tk.END)
+
+        self.right_text.config(state=tk.NORMAL)
+        self.right_text.delete("1.0", tk.END)
+
+        if SHOW_ONLY_TRANSLATION:
+            # Only show entries that have been translated
+            translated_entries = [e for e in self.caption_entries if e["translated"]]
+            for i, entry in enumerate(translated_entries):
+                if i > 0:
+                    self.right_text.insert(tk.END, "\n")
+                self.right_text.insert(tk.END, entry["translated"])
+        else:
+            for i, entry in enumerate(self.caption_entries):
+                if i > 0:
+                    self.left_text.insert(tk.END, "\n")
+                    self.right_text.insert(tk.END, "\n")
+                self.left_text.insert(tk.END, entry["source"])
+                if entry["translated"]:
+                    self.right_text.insert(tk.END, entry["translated"])
+
+        if not SHOW_ONLY_TRANSLATION:
+            self.left_text.config(state=tk.DISABLED)
+        self.right_text.config(state=tk.DISABLED)
+        self._scroll_to_end()
+
+    def _trim_buffer(self):
+        if len(self.caption_entries) > MAX_BUFFER_LINES:
+            remove_count = len(self.caption_entries) - MAX_BUFFER_LINES
+            self.caption_entries = self.caption_entries[remove_count:]
+            self._rebuild_text_widgets()
+
+    def _scroll_to_end(self):
+        self.right_text.see(tk.END)
+        if not SHOW_ONLY_TRANSLATION:
+            self.left_text.see(tk.END)
+
+    def _update_partial_display(self):
         if self.current_partial:
-            rows.append((f"{self.current_partial} …", ""))
-
-        if not rows:
-            rows.append(("Listening…", ""))
-
-        start = max(0, len(rows) - MAX_LINES)
-        display = rows[start:]
-
-        for i in range(MAX_LINES):
-            if i < len(display):
-                left_text, right_text = display[i]
-                self.left_labels[i].config(text=left_text)
-                self.right_labels[i].config(text=right_text)
-            else:
-                self.left_labels[i].config(text="")
-                self.right_labels[i].config(text="")
-
-    def _schedule_fade_check(self):
-        self.root.after(int(FADE_AFTER_SECONDS * 1000), self._check_fade)
-
-    def _check_fade(self):
-        if time.time() - self.last_speech_time > FADE_AFTER_SECONDS:
-            if self.caption_lines or self.current_partial:
-                self.caption_lines = []
-                self.current_partial = ""
-                self._render()
-        if self.running:
-            self._schedule_fade_check()
+            self.partial_left.config(text=f"{self.current_partial} …")
+        else:
+            self.partial_left.config(text="")
 
     # -------------------- Lifecycle --------------------
     def _fatal_error(self, msg):
-        for i in range(MAX_LINES):
-            if i == MAX_LINES // 2:
-                self.left_labels[i].config(text=msg, fg="#ff6666")
-            else:
-                self.left_labels[i].config(text="")
-            self.right_labels[i].config(text="")
+        self.right_text.config(state=tk.NORMAL)
+        self.right_text.delete("1.0", tk.END)
+        self.right_text.insert("1.0", msg)
+        self.right_text.config(fg="#ff6666")
+        self.right_text.config(state=tk.DISABLED)
+        if not SHOW_ONLY_TRANSLATION:
+            self.left_text.config(state=tk.NORMAL)
+            self.left_text.delete("1.0", tk.END)
+            self.left_text.insert("1.0", msg)
+            self.left_text.config(fg="#ff6666")
+            self.left_text.config(state=tk.DISABLED)
         self.root.after(8000, self.shutdown)
 
     def shutdown(self):
         self.running = False
+        if self._sentence_timer:
+            self._sentence_timer.cancel()
         if hasattr(self, "audio_proc"):
             self.audio_proc.terminate()
         self.root.destroy()
@@ -764,6 +631,12 @@ def list_sources():
 
 
 def parse_mode(mode_str):
+    """
+    Parse --mode string.
+    Format: SOURCE-TARGET  (e.g., 'zh-en', 'en-us-es')
+            or just SOURCE (e.g., 'es' for no translation)
+    Splits on the LAST hyphen so locale codes like 'en-us' work as source keys.
+    """
     if "-" in mode_str:
         source, target = mode_str.rsplit("-", 1)
         return source, target
@@ -773,11 +646,17 @@ def parse_mode(mode_str):
 def main():
     parser = argparse.ArgumentParser(description="Live Caption Generator for Linux")
     parser.add_argument(
-        "--mode", default="en",
-        help="Language mode: SOURCE-TARGET (e.g., 'ru-en', 'es-en') or just SOURCE (e.g., 'en').",
+        "--mode",
+        default="en",
+        help="Language mode: SOURCE-TARGET (e.g., 'zh-en', 'es-en') or just SOURCE (e.g., 'en'). "
+             "Source must be a key in VOSK_MODELS. Target is the translation language.",
     )
-    parser.add_argument("-d", "--device", help="PulseAudio source name")
-    parser.add_argument("--list-devices", action="store_true", help="List audio sources and exit")
+    parser.add_argument(
+        "-d", "--device", help="PulseAudio source name (default: monitor of default sink)"
+    )
+    parser.add_argument(
+        "--list-devices", action="store_true", help="List audio sources and exit"
+    )
     args = parser.parse_args()
 
     if args.list_devices:
@@ -786,6 +665,7 @@ def main():
 
     source_lang, target_lang = parse_mode(args.mode)
 
+    # Validate source language key
     model_path = VOSK_MODELS.get(source_lang)
     if not model_path:
         print(f"Error: No VOSK model configured for language key '{source_lang}'.")
@@ -807,4 +687,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
