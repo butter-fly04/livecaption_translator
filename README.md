@@ -27,13 +27,8 @@ source venv/bin/activate
 
 You should see `(venv)` at the beginning of your terminal prompt.
 
-### Step 4: Upgrade pip
 
-```bash
-pip install --upgrade pip
-```
-
-### Step 5: Install Dependencies
+### Step 4: Install Dependencies
 
 ```bash
 pip install -r requirements.txt
