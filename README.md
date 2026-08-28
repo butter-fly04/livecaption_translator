@@ -124,12 +124,8 @@ VOSK_MODELS = {
 **Language codes** follow ISO 639-1 (2-letter codes):
 - `en` = English
 - `es` = Spanish
-- `fr` = French
-- `de` = German
 - `ru` = Russian
 - `zh` = Chinese
-- `ja` = Japanese
-- `pt` = Portuguese
 - `ar` = Arabic
 
 See the **[full list of ISO 639-1 codes](https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes)**.
