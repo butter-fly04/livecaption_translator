@@ -123,36 +123,6 @@ All customization is done by editing the **"CUSTOMIZE THESE"** section in `live_
 
 ---
 
-### Translation Engine
-
-| Option | Purpose | Requires |
-|---|---|---|
-| `TRANSLATOR_ENGINE = "argos"` | Offline translation (OpenNMT) | `pip install argostranslate` |
-| `TRANSLATOR_ENGINE = "libre"` | Online via LibreTranslate (free) | `pip install requests` |
-| `TRANSLATOR_ENGINE = "deepl"` | Online via DeepL (paid API key) | `pip install requests` + API key |
-| `TRANSLATOR_ENGINE = "google"` | Online via Google Translate (free) | `pip install deep-translator` |
-| `TRANSLATOR_ENGINE = "none"` | Disable translation | None |
-
-#### Offline Translation (Recommended for Privacy)
-
-```python
-TRANSLATOR_ENGINE = "argos"
-# Then run: pip install argostranslate
-```
-
-
-#### DeepL (Paid, High Quality)
-
-```python
-TRANSLATOR_ENGINE = "deepl"
-DEEPL_API_KEY = "your-api-key-here"
-# Get an API key from: https://www.deepl.com/en/pro
-# Then run: pip install requests
-```
-
-
----
-
 ### VOSK Models (Speech Recognition Languages)
 
 The `VOSK_MODELS` dictionary maps language codes to model paths. Add or modify entries for languages you want to recognize:
