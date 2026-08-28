@@ -1,11 +1,10 @@
 # livecaption_translator
 Live caption genarator from system audio output for Linux
 
----
 
-# Installation & Setup Guide
+### Installation & Setup Guide
 
-## Installation on Linux (Virtual Environment)
+### Installation on Linux (Virtual Environment)
 
 ### Step 1: Clone the Repository
 
