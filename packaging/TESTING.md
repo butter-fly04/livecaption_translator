@@ -2,16 +2,21 @@
 
 Two artifacts are built and kept in `dist/`:
 
-- `LiveCaption-<version>-x86_64.AppImage` — native host build, using the host
-  Python and Tk. Runs only on systems whose glibc is at least as new as the
-  build host's.
+- `LiveCaption-<version>-fedora-x86_64.AppImage` — Fedora-native build, using
+  Fedora's Python and Tk. Runs only on systems whose glibc is at least as new
+  as the build Fedora release's.
 - `LiveCaption-<version>-ubuntu24.04-x86_64.AppImage` — Ubuntu 24.04 container
-  build (glibc 2.39). This is the portable/release artifact.
+  build (glibc 2.39). This is the portable/release artifact and the recommended
+  download for most users.
 
-Run the automated smoke test first on each:
+Run the automated smoke test on each in an environment that can execute it:
 
 ```bash
-packaging/smoke-test.sh dist/LiveCaption-*.AppImage
+# Portable build: any current Linux host
+packaging/smoke-test.sh dist/LiveCaption-*-ubuntu24.04-x86_64.AppImage
+
+# Fedora build: on Fedora, or inside the Fedora build container
+packaging/smoke-test.sh dist/LiveCaption-*-fedora-x86_64.AppImage
 ```
 
 It uses temporary `LIVE_CAPTION_CONFIG_DIR` / `LIVE_CAPTION_DATA_DIR` folders,
@@ -90,9 +95,13 @@ system. Build release artifacts in the container, not on a rolling host.
 
 - [ ] `__version__` in `src/livecaption/__init__.py` matches the tag
 - [ ] tag is `vX.Y.Z`
-- [ ] release uses the Ubuntu 24.04 build, not the native host build
-- [ ] CI built on `ubuntu-24.04`
-- [ ] `.AppImage`, `.sha256` and `.zsync` are attached to the release
-- [ ] `APPIMAGE_UPDATE_INFO` points at the release `.zsync`
+- [ ] both variants are attached and clearly named:
+      `LiveCaption-<version>-ubuntu24.04-x86_64.AppImage` and
+      `LiveCaption-<version>-fedora-x86_64.AppImage`
+- [ ] `.sha256` is attached for both variants
+- [ ] the Ubuntu `.zsync` is attached and `APPIMAGE_UPDATE_INFO` points at it
+- [ ] the Ubuntu build was produced on `ubuntu-24.04`
+- [ ] the Fedora build was smoke-tested inside the Fedora container
+- [ ] release notes say which variant most users should download
 - [ ] release notes include the minimum glibc / tested systems
 - [ ] no `-dirty` in any published filename

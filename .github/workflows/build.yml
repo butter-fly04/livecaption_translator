@@ -10,13 +10,17 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: Ubuntu ${{ matrix.os }}
+  ubuntu:
+    name: Ubuntu ${{ matrix.suffix }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
+        include:
+          - os: ubuntu-22.04
+            suffix: ubuntu22.04
+          - os: ubuntu-24.04
+            suffix: ubuntu24.04
 
     steps:
       - name: Check out
@@ -27,7 +31,7 @@ jobs:
           sudo apt-get -o Acquire::Retries=5 update
           sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
             python3-venv python3-tk libpython3-dev libpulse0 zsync file \
-            desktop-file-utils binutils
+            curl ca-certificates desktop-file-utils binutils
 
       - name: Install Python dependencies
         run: |
@@ -46,16 +50,45 @@ jobs:
           . .venv/bin/activate
           export PYTHON="$PWD/.venv/bin/python"
           export VERSION="0.0.0-${GITHUB_SHA::7}"
+          export SUFFIX="${{ matrix.suffix }}"
           packaging/build-appimage.sh
 
       - name: Smoke test
         run: |
-          packaging/smoke-test.sh dist/LiveCaption-*.AppImage
+          packaging/smoke-test.sh dist/LiveCaption-*-${{ matrix.suffix }}-x86_64.AppImage
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
         with:
-          name: LiveCaption-${{ matrix.os }}
+          name: LiveCaption-${{ matrix.suffix }}
+          path: |
+            dist/*.AppImage
+            dist/*.sha256
+            dist/*.zsync
+          if-no-files-found: error
+
+  fedora:
+    name: Fedora (container)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Build and smoke-test in a Fedora container
+        run: |
+          CONTAINER=docker \
+          IMAGE=live-caption-build:fedora \
+          DOCKERFILE=Dockerfile.fedora \
+          SUFFIX=fedora \
+          SMOKE_TEST=1 \
+          VERSION="0.0.0-${GITHUB_SHA::7}" \
+          packaging/build-in-container.sh
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveCaption-fedora
           path: |
             dist/*.AppImage
             dist/*.sha256

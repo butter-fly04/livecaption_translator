@@ -2,18 +2,23 @@
 #
 # Build both AppImages and keep them side by side in dist/:
 #
-#   LiveCaption-<version>-x86_64.AppImage
-#       Built with the host Python and Tk.  This is the native build: it uses
-#       the host glibc and the host Tk, so it only runs on systems with a glibc
-#       at least as new as the build host.  Use it locally.
+#   LiveCaption-<version>-fedora-x86_64.AppImage
+#       Built with the host Python and Tk on Fedora.  This is the native build:
+#       it uses Fedora's glibc and Tk, so it only runs on systems with a glibc
+#       at least as new as the build host.  Run this script on Fedora; on other
+#       hosts build the Fedora variant with Dockerfile.fedora instead.
 #
 #   LiveCaption-<version>-ubuntu24.04-x86_64.AppImage
 #       Built in an Ubuntu 24.04 container, so it needs only glibc 2.39 and
-#       runs on Ubuntu 24.04, Linux Mint 22.3 and newer.  This is the one to
-#       distribute.
+#       runs on Ubuntu 24.04, Linux Mint 22.3 and newer.  This is the portable
+#       one and the recommended download for most users.
 #
 #   PYTHON=.venv/bin/python packaging/build-both.sh
 #   CONTAINER=podman PYTHON=.venv/bin/python packaging/build-both.sh
+#
+# To build the Fedora variant in a container instead of on the host:
+#   DOCKERFILE=Dockerfile.fedora IMAGE=live-caption-build:fedora \
+#       SUFFIX=fedora packaging/build-in-container.sh
 #
 # Environment:
 #   PYTHON      Python for the native build (default: python3)
@@ -37,8 +42,8 @@ if [ -z "${CONTAINER:-}" ]; then
     fi
 fi
 
-echo "==> Native host build"
-PYTHON="$PYTHON" SUFFIX= VERSION="${VERSION:-}" "$ROOT/packaging/build-appimage.sh"
+echo "==> Fedora-native host build"
+PYTHON="$PYTHON" SUFFIX=fedora VERSION="${VERSION:-}" "$ROOT/packaging/build-appimage.sh"
 
 echo "==> Ubuntu 24.04 compatible build"
 CONTAINER="$CONTAINER" SUFFIX=ubuntu24.04 VERSION="${VERSION:-}" \

@@ -24,7 +24,7 @@ jobs:
           sudo apt-get -o Acquire::Retries=5 update
           sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
             python3-venv python3-tk libpython3-dev libpulse0 zsync file \
-            desktop-file-utils binutils
+            curl ca-certificates desktop-file-utils binutils
 
       - name: Install Python dependencies
         run: |
@@ -39,18 +39,28 @@ jobs:
             VERSION="0.0.0-${GITHUB_SHA::7}"
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "APPIMAGE_UPDATE_URL=https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/LiveCaption-${VERSION}-x86_64.AppImage.zsync" >> "$GITHUB_ENV"
+          echo "APPIMAGE_UPDATE_URL=https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/LiveCaption-${VERSION}-ubuntu24.04-x86_64.AppImage.zsync" >> "$GITHUB_ENV"
 
-      - name: Build
+      - name: Build portable Ubuntu 24.04 AppImage
         run: |
           . .venv/bin/activate
           export PYTHON="$PWD/.venv/bin/python"
-          export APPIMAGE_UPDATE_INFO="gh-releases-zsync|${GITHUB_REPOSITORY_OWNER}|${GITHUB_REPOSITORY#*/}|latest|LiveCaption-*-x86_64.AppImage.zsync"
+          export SUFFIX=ubuntu24.04
+          export APPIMAGE_UPDATE_INFO="gh-releases-zsync|${GITHUB_REPOSITORY_OWNER}|${GITHUB_REPOSITORY#*/}|latest|LiveCaption-*-ubuntu24.04-x86_64.AppImage.zsync"
           packaging/build-appimage.sh
 
-      - name: Smoke test
+      - name: Build Fedora AppImage
         run: |
-          packaging/smoke-test.sh dist/LiveCaption-*.AppImage
+          CONTAINER=docker \
+          IMAGE=live-caption-build:fedora \
+          DOCKERFILE=Dockerfile.fedora \
+          SUFFIX=fedora \
+          SMOKE_TEST=1 \
+          packaging/build-in-container.sh
+
+      - name: Smoke test the Ubuntu AppImage
+        run: |
+          packaging/smoke-test.sh dist/LiveCaption-*-ubuntu24.04-x86_64.AppImage
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -66,8 +76,23 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          body: |
+            ## Which file should I download?
+
+            | Your system | Download |
+            |---|---|
+            | Ubuntu 24.04+, Linux Mint 22.x+, Debian 13+, Arch, or unsure | `LiveCaption-${{ env.VERSION }}-ubuntu24.04-x86_64.AppImage` |
+            | Fedora (current release) | `LiveCaption-${{ env.VERSION }}-fedora-x86_64.AppImage` |
+
+            The **Ubuntu 24.04 build is the portable one** and is recommended for
+            most users. The **Fedora build** is compiled against Fedora's own glibc
+            and Tk for a native fit; it will not run on distributions with an older
+            glibc.
+
+            Each AppImage has a `.sha256` checksum. The Ubuntu build also has a
+            `.zsync` delta file for AppImageUpdate.
+          generate_release_notes: true
           files: |
             dist/*.AppImage
             dist/*.sha256
-            dist/*.zsync
-          generate_release_notes: true
+            dist/*-ubuntu24.04-*.zsync

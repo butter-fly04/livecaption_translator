@@ -35,9 +35,23 @@ Run from a checkout with `python -m livecaption` after installing the package
 
 ---
 
-## Install and run
+## Download and run
 
-Download `LiveCaption-<version>-x86_64.AppImage`, then:
+Each release contains two AppImages. Pick the one that matches your system:
+
+| Your system | Download | Notes |
+|---|---|---|
+| Ubuntu 24.04+, Linux Mint 22.x+, Debian 13+, Arch, or unsure | `LiveCaption-<version>-ubuntu24.04-x86_64.AppImage` | Portable build. **Recommended for most users.** |
+| Fedora (current release) | `LiveCaption-<version>-fedora-x86_64.AppImage` | Native Fedora build (Fedora glibc and Tk). |
+
+Both files contain the same application and features. The Ubuntu build is the
+safe default; the Fedora build is for current Fedora systems and will not start
+on distributions with an older glibc. Ubuntu 22.04 and older cannot run the
+Ubuntu 24.04 build, so build from source there.
+
+Download from the
+[latest release](https://github.com/butter-fly04/livecaption_translator/releases/latest),
+then:
 
 ```bash
 chmod +x LiveCaption-*.AppImage
@@ -157,22 +171,24 @@ PYTHON="$PWD/.venv/bin/python" packaging/build-appimage.sh
 The result is:
 
 ```text
-dist/LiveCaption-<version>-x86_64.AppImage
-dist/LiveCaption-<version>-x86_64.AppImage.sha256
-dist/LiveCaption-<version>-x86_64.AppImage.zsync   # if zsyncmake is installed
+dist/LiveCaption-<version>[-<suffix>]-x86_64.AppImage
+dist/LiveCaption-<version>[-<suffix>]-x86_64.AppImage.sha256
+dist/LiveCaption-<version>[-<suffix>]-x86_64.AppImage.zsync   # if zsyncmake is installed
 ```
+
+Without `SUFFIX` the name has no variant label; the release scripts add
+`fedora` or `ubuntu24.04`.
 
 The version comes from `git describe --tags --always` (without a `-dirty`
 suffix), falling back to `__version__` in `src/livecaption/__init__.py` when
-building from an archive without `.git`. To keep two builds side by side, use
-`SUFFIX`:
+building from an archive without `.git`. To give the artifact an explicit
+variant label, use `SUFFIX`:
 
 ```bash
-PYTHON="$PWD/.venv/bin/python" packaging/build-appimage.sh          # native host
-PYTHON="$PWD/.venv/bin/python" SUFFIX=host packaging/build-appimage.sh
+PYTHON="$PWD/.venv/bin/python" SUFFIX=fedora packaging/build-appimage.sh
 ```
 
-Or build both the native and the Ubuntu-compatible AppImage in one go:
+On Fedora, build both release variants in one go:
 
 ```bash
 PYTHON="$PWD/.venv/bin/python" packaging/build-both.sh
@@ -181,10 +197,17 @@ PYTHON="$PWD/.venv/bin/python" packaging/build-both.sh
 This produces:
 
 ```text
-dist/LiveCaption-<version>-x86_64.AppImage
-    Native host build (host Tk, host glibc).  Use locally.
+dist/LiveCaption-<version>-fedora-x86_64.AppImage
+    Fedora-native build (Fedora glibc and Tk).  For current Fedora.
 dist/LiveCaption-<version>-ubuntu24.04-x86_64.AppImage
-    Ubuntu 24.04 container build (glibc 2.39).  Use for releases.
+    Ubuntu 24.04 container build (glibc 2.39).  Portable; recommended.
+```
+
+On a non-Fedora host, build the Fedora variant in a Fedora container:
+
+```bash
+DOCKERFILE=Dockerfile.fedora IMAGE=live-caption-build:fedora \
+    SUFFIX=fedora SMOKE_TEST=1 packaging/build-in-container.sh
 ```
 
 Smoke-test it without touching your real settings:
@@ -207,12 +230,22 @@ separate: the native build keeps the host Tk behaviour (Tk 9 on current
 Fedora), and the Ubuntu build is the portable one.
 
 For a distributable artifact, build on the oldest target you support. This repo
-ships a container recipe based on Ubuntu 24.04:
+ships two container recipes: Ubuntu 24.04 for the portable build and Fedora for
+the native build.
 
 ```bash
+# Portable Ubuntu 24.04 build
 packaging/build-in-container.sh          # docker
 CONTAINER=podman packaging/build-in-container.sh
+
+# Fedora-native build
+DOCKERFILE=Dockerfile.fedora IMAGE=live-caption-build:fedora \
+    SUFFIX=fedora SMOKE_TEST=1 packaging/build-in-container.sh
 ```
+
+`SMOKE_TEST=1` runs `packaging/smoke-test.sh` inside the same container, which
+is required for the Fedora build when the host is not Fedora: its glibc is too
+new for an Ubuntu host to run directly.
 
 To support older distros, change the `FROM` line in
 `packaging/Dockerfile` to an older base (for example Ubuntu 22.04 or a
@@ -232,7 +265,7 @@ runtime to `/tmp` on every start; the AppImage already provides a single
 read-only file.
 
 ```text
-LiveCaption-<version>-x86_64.AppImage
+LiveCaption-<version>-<variant>-x86_64.AppImage
 └── squashfs-root/
     ├── AppRun
     ├── live-caption.desktop
@@ -315,16 +348,19 @@ automatically. It uses temporary config/model folders.
 
 The repository has two workflows:
 
-- `.github/workflows/build.yml` — builds and smoke-tests on Ubuntu 22.04 and
-  24.04 for pushes and pull requests.
-- `.github/workflows/release.yml` — on a `v*` tag, builds on Ubuntu 24.04,
-  attaches the AppImage, `.sha256`, and `.zsync` to the GitHub release, and
-  embeds AppImageUpdate information.
+- `.github/workflows/build.yml` — builds and smoke-tests Ubuntu 22.04, Ubuntu
+  24.04, and Fedora (in a Fedora container) for pushes and pull requests.
+- `.github/workflows/release.yml` — on a `v*` tag, builds both release variants,
+  attaches both AppImages with their `.sha256` files (and the Ubuntu `.zsync`)
+  to the GitHub release, and embeds AppImageUpdate information in the Ubuntu
+  build.
 
-Release builds are published as `LiveCaption-<version>-x86_64.AppImage`. A
-local `packaging/build-both.sh` run additionally keeps the native build under
-the same name and the Ubuntu build as
-`LiveCaption-<version>-ubuntu24.04-x86_64.AppImage`.
+Release assets are named explicitly:
+
+```text
+LiveCaption-<version>-ubuntu24.04-x86_64.AppImage   portable; recommended
+LiveCaption-<version>-fedora-x86_64.AppImage        Fedora-native
+```
 
 ### Delta updates
 
@@ -332,13 +368,14 @@ the same name and the Ubuntu build as
 release workflow passes:
 
 ```text
-gh-releases-zsync|<owner>|<repo>|latest|LiveCaption-*-x86_64.AppImage.zsync
+gh-releases-zsync|<owner>|<repo>|latest|LiveCaption-*-ubuntu24.04-x86_64.AppImage.zsync
 ```
 
-Users with [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate)
-can then update in place. Without an update tool, users download the new
-AppImage manually; config and models are untouched because they live in XDG
-folders.
+Only the portable Ubuntu build embeds update information, so AppImageUpdate
+always follows that variant. Users with
+[AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) can update
+in place. Without an update tool, users download the new AppImage manually;
+config and models are untouched because they live in XDG folders.
 
 ---
 
