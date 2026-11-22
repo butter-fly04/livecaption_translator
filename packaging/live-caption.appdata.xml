@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>live-caption</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <name>Live Caption</name>
+  <summary>Real-time captions and translation for system audio</summary>
+  <description>
+    <p>
+      Live Caption captures the audio your computer is playing and shows it as
+      live captions, optionally translated in real time. Speech recognition runs
+      locally with sherpa-onnx; speech models are downloaded separately.
+    </p>
+  </description>
+  <launchable type="desktop-id">live-caption.desktop</launchable>
+  <provides>
+    <binary>live-caption</binary>
+  </provides>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Accessibility</category>
+    <category>Utility</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+</component>

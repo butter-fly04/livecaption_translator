@@ -1,0 +1,73 @@
+name: Release AppImage
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system packages
+        run: |
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+            python3-venv python3-tk libpython3-dev libpulse0 zsync file \
+            desktop-file-utils binutils
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install -r requirements-build.txt
+
+      - name: Work out version and update URL
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            VERSION="0.0.0-${GITHUB_SHA::7}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "APPIMAGE_UPDATE_URL=https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/LiveCaption-${VERSION}-x86_64.AppImage.zsync" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          . .venv/bin/activate
+          export PYTHON="$PWD/.venv/bin/python"
+          export APPIMAGE_UPDATE_INFO="gh-releases-zsync|${GITHUB_REPOSITORY_OWNER}|${GITHUB_REPOSITORY#*/}|latest|LiveCaption-*-x86_64.AppImage.zsync"
+          packaging/build-appimage.sh
+
+      - name: Smoke test
+        run: |
+          packaging/smoke-test.sh dist/LiveCaption-*.AppImage
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveCaption-release
+          path: |
+            dist/*.AppImage
+            dist/*.sha256
+            dist/*.zsync
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.AppImage
+            dist/*.sha256
+            dist/*.zsync
+          generate_release_notes: true

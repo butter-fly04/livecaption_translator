@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "live-caption"
+dynamic = ["version"]
+description = "Real-time captions and translation for system audio"
+readme = "README.md"
+license = { text = "GPL-3.0-only" }
+authors = [{ name = "butter-fly04" }]
+keywords = ["captions", "subtitles", "speech-recognition", "translation", "linux"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pulsectl>=24.12.0",
+    "sherpa-onnx>=1.13.8,<2",
+    "requests>=2.31",
+    "dbus-next>=0.2.3",
+    "Pillow>=10",
+]
+
+[project.scripts]
+live-caption = "livecaption.live_caption:main"
+
+[project.urls]
+Homepage = "https://github.com/butter-fly04/livecaption_translator"
+Repository = "https://github.com/butter-fly04/livecaption_translator"
+Issues = "https://github.com/butter-fly04/livecaption_translator/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "livecaption.__version__" }

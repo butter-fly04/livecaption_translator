@@ -1,0 +1,7 @@
+numpy>=1.24
+pulsectl>=24.12.0
+# Tested with 1.13.8.  Keep below 2.x until the recognizer API is verified.
+sherpa-onnx>=1.13.8,<2
+requests>=2.31
+dbus-next>=0.2.3
+Pillow>=10

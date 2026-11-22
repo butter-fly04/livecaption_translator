@@ -1,0 +1,42 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and packaging metadata
+.venv/
+venv/
+env/
+.eggs/
+*.egg-info/
+*.egg
+
+# Build output
+build/
+dist/
+*.spec.bak
+
+# AppImage build cache and artifacts
+packaging/.cache/
+*.AppImage
+*.AppImage.sha256
+*.AppImage.zsync
+
+# Local configuration and downloaded models
+/live_caption_config.json
+/src/livecaption/live_caption_config.json
+/models/
+catalog.json
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

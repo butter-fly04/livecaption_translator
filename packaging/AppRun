@@ -1,0 +1,12 @@
+#!/bin/sh
+# AppImage entry point.  The PyInstaller onedir bundle lives in
+# usr/bin/live-caption/, with its libraries in _internal/.
+set -eu
+
+HERE="$(dirname "$(readlink -f "$0")")"
+BUNDLE="$HERE/usr/bin/live-caption"
+
+export PATH="$BUNDLE:$PATH"
+export LD_LIBRARY_PATH="$BUNDLE/_internal:$BUNDLE/_internal/sherpa_onnx/lib:$BUNDLE/_internal/sherpa_onnx.libs:${LD_LIBRARY_PATH:-}"
+
+exec "$BUNDLE/live-caption" "$@"

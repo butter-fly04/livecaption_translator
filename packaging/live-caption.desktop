@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Live Caption
+GenericName=Live Captions
+Comment=Real-time captions and translation for system audio
+Exec=live-caption
+Icon=live-caption
+Terminal=false
+Categories=AudioVideo;Accessibility;
+Keywords=captions;subtitles;speech;transcription;accessibility;
+StartupNotify=false
+StartupWMClass=live-caption
