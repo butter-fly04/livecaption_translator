@@ -1,12 +1,15 @@
 # Fedora-native AppImage build environment.
 #
 # This produces the Fedora variant: it is built against Fedora's glibc and Tk,
-# so it is intended for the current Fedora release.  For the portable artifact
-# use Dockerfile (Ubuntu 24.04) instead.
+# so it is intended for current Fedora systems.  For the portable artifact use
+# Dockerfile (Ubuntu 24.04) instead.
 #
 #   docker build -f packaging/Dockerfile.fedora -t live-caption-build:fedora packaging
 #
-FROM fedora:latest
+# Pinned to Fedora 44 on purpose.  It ships Python 3.14, for which sherpa-onnx
+# publishes wheels.  A newer Fedora may ship a Python version without a wheel,
+# and pip would then try (and fail) to compile sherpa-onnx from source.
+FROM fedora:44
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
