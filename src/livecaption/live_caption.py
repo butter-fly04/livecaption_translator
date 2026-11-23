@@ -7,6 +7,7 @@ translation. UI lives in caption_ui.py, the settings form in settings_ui.py.
 """
 
 import argparse
+import gc
 import json
 import os
 import queue
@@ -279,6 +280,21 @@ def make_translator(cfg, from_code, to_code):
         url=cfg["translator_url"], fallback=cfg["translator_fallback"])
 
 
+def malloc_trim():
+    """Return free heap pages to the OS.
+
+    glibc grows each thread's arena in 64 MB steps and keeps freed memory
+    mapped.  Rebuilding the speech model a few times (language switches, a
+    changed pause preset, ...) can therefore leave hundreds of MB of free but
+    still-mapped heap.  malloc_trim() hands it back.  No-op where unavailable.
+    """
+    try:
+        import ctypes
+        ctypes.CDLL(None).malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 # ==================== APP (backend) ====================
 
 class LiveCaptionApp:
@@ -300,6 +316,14 @@ class LiveCaptionApp:
         self._rule_lock = threading.Lock()      # guards recognizer/stream/translator swaps
         self._reload_lock = threading.Lock()    # one reload at a time
         self.recognizer = self.stream = self.translator = None
+
+        # Set while the recognition thread has dropped its reference to the old
+        # recognizer, so a reload can free it before building the next one.
+        self._recognizer_idle = threading.Event()
+        self._recognizer_idle.set()
+        # Coalesces bursts of settings changes into one rebuild of the latest cfg.
+        self._reload_cv = threading.Condition()
+        self._reload_request = None
 
         # Everything the Settings window / menus can change on this side.
         config = config or {}
@@ -373,9 +397,11 @@ class LiveCaptionApp:
         self.capture_thread = threading.Thread(target=self._capture_audio, daemon=True)
         self.recognize_thread = threading.Thread(target=self._recognize_audio, daemon=True)
         self.translation_thread = threading.Thread(target=self._translation_worker, daemon=True)
+        self.reload_thread = threading.Thread(target=self._reload_loop, daemon=True)
         self.capture_thread.start()
         self.recognize_thread.start()
         self.translation_thread.start()
+        self.reload_thread.start()
 
     def _model_problem(self, cfg=None):
         """A message if the active language has no usable model folder, else None."""
@@ -554,16 +580,31 @@ class LiveCaptionApp:
             # else: the active language has no model yet; the rest still saves
 
         self.cfg = new
-        threading.Thread(target=self._reload_in_background, args=(reload_asr,), daemon=True).start()
+        self._request_reload(reload_asr)
 
-    def _reload_in_background(self, reload_asr):
-        try:
-            self.window.set_status("Applying settings…")
-            self._apply_config(reload_asr)
-            self.window.set_status("Listening…")
-        except Exception as e:
-            print(f"[Settings] Could not apply: {e}")
-            self.window.set_status(f"Settings not applied:\n{e}")
+    def _request_reload(self, reload_asr):
+        """Ask the reload thread to apply self.cfg.  Bursts of menu clicks
+        collapse into a single rebuild: the thread always uses the latest cfg."""
+        with self._reload_cv:
+            self._reload_request = bool(self._reload_request or reload_asr)
+            self._reload_cv.notify()
+
+    def _reload_loop(self):
+        while self.running:
+            with self._reload_cv:
+                while self._reload_request is None and self.running:
+                    self._reload_cv.wait(timeout=0.5)
+                if not self.running:
+                    return
+                reload_asr = self._reload_request
+                self._reload_request = None
+            try:
+                self.window.set_status("Applying settings…")
+                self._apply_config(reload_asr)
+                self.window.set_status("Listening…")
+            except Exception as e:
+                print(f"[Settings] Could not apply: {e}")
+                self.window.set_status(f"Settings not applied:\n{e}")
 
     def _apply_config(self, reload_asr=True):
         """(Re)build the recognizer and translator from self.cfg and swap them in.
@@ -578,10 +619,34 @@ class LiveCaptionApp:
 
             recognizer = stream = None
             if reload_asr or language_changed:
+                # Validate before tearing down the working recognizer, so a bad
+                # path leaves the current model running.
                 if not model_path or not os.path.isdir(model_path):
                     raise FileNotFoundError(self._model_problem(cfg) or
                                             f"Model folder for '{source}' not found:\n{model_path}")
-                recognizer = make_recognizer(detect_model(model_path), cfg)
+                info = detect_model(model_path)
+
+                # Retire the old recognizer *before* loading the new one.
+                # sherpa-onnx / ONNX Runtime keep per-session memory arenas;
+                # building a second session while the first is still being
+                # decoded makes glibc grow fresh 64 MB heaps for every reload,
+                # so RSS ratchets by ~200 MB per language switch and never
+                # comes back down.  Letting the old session go first keeps the
+                # footprint flat, and malloc_trim returns the freed pages.
+                with self._rule_lock:
+                    old_recognizer, old_stream = self.recognizer, self.stream
+                    if old_recognizer is not None:
+                        self._recognizer_idle.clear()
+                    self.recognizer = self.stream = None
+                if old_recognizer is not None:
+                    # The recognition thread drops its local reference on its
+                    # next pass and sets this event.
+                    self._recognizer_idle.wait(timeout=2.0)
+                del old_recognizer, old_stream
+                gc.collect()
+                malloc_trim()
+
+                recognizer = make_recognizer(info, cfg)
                 stream = recognizer.create_stream()
 
             translator = make_translator(cfg, source, target)
@@ -589,9 +654,13 @@ class LiveCaptionApp:
                 if recognizer is not None:
                     self.recognizer, self.stream = recognizer, stream
                     self._last_partial_sent = ""
+                    self._recognizer_idle.clear()
                 self.translator = translator
                 self.translate_from, self.translate_to = source, target
                 self.model_path = model_path
+
+            gc.collect()
+            malloc_trim()
 
             if language_changed:
                 # Captions (and pending translations) from the old language don't
@@ -617,6 +686,8 @@ class LiveCaptionApp:
 
     def _on_shutdown(self):
         self.running = False
+        with self._reload_cv:
+            self._reload_cv.notify_all()
         cap = getattr(self, "_capture", None)
         if cap is not None:
             cap.stop()
@@ -661,6 +732,9 @@ class LiveCaptionApp:
             try:
                 data = self.audio_queue.get(timeout=0.5)
                 if self._paused:
+                    # Let go of any recognizer so a pending swap can free it.
+                    recognizer = stream = translator = None
+                    self._recognizer_idle.set()
                     continue  # "deaf mode": keep draining the queue, ignore the audio
 
                 # s16le bytes -> float32 in [-1, 1], as required by sherpa-onnx
@@ -674,6 +748,7 @@ class LiveCaptionApp:
                     stream = self.stream
                     translator = self.translator
                     if recognizer is None:
+                        self._recognizer_idle.set()   # a swap is waiting for this
                         continue            # no model loaded yet (first run)
 
                     stream.accept_waveform(SAMPLE_RATE, samples)
